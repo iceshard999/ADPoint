@@ -12,6 +12,7 @@ const char* ssid = "lab309";
 const char* password = "ustc1234";
 //WebServer server(80); //声明WebServer对象
 
+int amp_factor = 5; //放大倍数
 long lastMsg = 0;
 long lastADC = 0;
 float value = 0;
@@ -26,6 +27,8 @@ int out_value = 0;
 float out_last = 0; //上一次滤波值
 char fisrt_flag = 1;
 
+int led_flag = 0;
+
 int16_t result;
 
 /* Be sure to update this value based on the IC and the gain settings! */
@@ -37,7 +40,7 @@ char valueString[512];
 //IP address to send UDP data to:
 // either use the ip address of the server or 
 // a network broadcast address
-const char * udpAddress = "192.168.124.7";
+const char * udpAddress = "192.168.124.11";
 const int udpPort = 47269;
 //Are we currently connected?
 boolean connected = false;
@@ -87,37 +90,63 @@ KFP KFP_height={0.02,0,0,0,0.001,0.543};
      return kfp->out;
  }
 
-// 低通滤波
-float fc = 10.0f;     //截止频率
-float Ts = 0.01f;    //采样周期
-float pi = 3.14159f; //π
-static float alpha = 0;     //滤波系数
+// 带通滤波器参数
+float fc_low = 5.0f;   // 低截止频率 (Hz)
+float fc_high = 15.0f; // 高截止频率 (Hz)
+float Ts = 0.02f;      // 采样周期 (对应100Hz采样率)
+float pi = 3.14159f;
 
-/************************ 滤波器初始化 alpha *****************************/
-void low_pass_filter_init(void)
+// 二阶带通滤波器系数
+static float a1, a2, b0, b1, b2;
+static float x1 = 0, x2 = 0;  // 输入历史值
+static float _y1 = 0, y2 = 0;  // 输出历史值
+static char first_flag = 1;
+
+/************************ 带通滤波器初始化 *****************************/
+void band_pass_filter_init(void)
 {
-  float b = 2.0 * pi * fc * Ts;
-  alpha = b / (b + 1);
+  // 计算中心频率和带宽
+  float center_freq = sqrt(fc_low * fc_high);
+  float bandwidth = fc_high - fc_low;
+  
+  // 预畸变
+  float omega_c = 2.0f * pi * center_freq;
+  float omega_bw = 2.0f * pi * bandwidth;
+  
+  // 双线性变换
+  float k = tan(omega_bw * Ts / 2.0f);
+  float norm = 1.0f + k + k*k;
+  
+  // 计算滤波器系数
+  b0 = k / norm;
+  b1 = 0.0f;
+  b2 = -k / norm;
+  a1 = (2.0f * (k*k - 1.0f)) / norm;
+  a2 = (1.0f - k + k*k) / norm;
 }
 
-float low_pass_filter(float value)
+float band_pass_filter(float value)
 {
+  float output;
   
-  float out;
-
-  /***************** 如果第一次进入，则给 out_last 赋值 ******************/
-  
-  if (fisrt_flag == 1)
+  // 第一次进入时初始化历史值
+  if (first_flag == 1)
   {
-    fisrt_flag = 0;
-    out_last = value;
+    first_flag = 0;
+    x1 = x2 = value;
+    _y1 = y2 = 0.0f;
   }
 
-  /*************************** 一阶滤波 *********************************/
-  out = out_last + alpha * (value - out_last);
-  out_last = out;
+  // 二阶差分方程: y[n] = b0*x[n] + b1*x[n-1] + b2*x[n-2] - a1*y[n-1] - a2*y[n-2]
+  output = b0 * value + b1 * x1 + b2 * x2 - a1 * _y1 - a2 * y2;
+  
+  // 更新历史值
+  x2 = x1;
+  x1 = value;
+  y2 = _y1;
+  _y1 = output;
 
-  return out;
+  return output;
 }
 
 
@@ -191,7 +220,10 @@ void setup(void)
   servo360.write(97);
   servo2.write(90);
 
-  low_pass_filter_init();
+  band_pass_filter_init();
+  //pinMode(8, OUTPUT); //设置GPIO2为输入模式，内置上拉电阻
+  //digitalWrite(8, LOW); //设置GPIO2输出高电平
+  Serial.println("Setup done!");
 
 }
 
@@ -199,12 +231,12 @@ void loop(void)
 {
   long now = millis();
 
-  if (now - lastADC >0) {
+  if (now - lastADC >5) {
     lastADC = now;
     result = ads.readADC_Differential_0_1();
 
     kalman_height = kalmanFilter(&KFP_height,(float)result);
-    out_value = int(low_pass_filter(result));
+    out_value = int(band_pass_filter(result));
 
     value = out_value * multiplier;
   
@@ -214,7 +246,16 @@ void loop(void)
     i_step++;
   }
 
-  if (now - lastMsg > 50) {
+  if (now - lastMsg > 100) {
+    
+    if (led_flag == 0){
+      led_flag = 1;
+      //digitalWrite(8, HIGH); //设置GPIO2输出高电平
+    }else{
+      led_flag = 0;
+      //digitalWrite(8, LOW); //设置GPIO2输出高电平  
+    }
+
     if (WiFi.status() == WL_CONNECTED){
       udp.beginPacket(udpAddress,udpPort);
       udp.printf("Voltage(mV):%s|mV", valueString); 
@@ -223,27 +264,10 @@ void loop(void)
 
     // clear valueString
     memset(valueString, '\0', sizeof(valueString));
-    float max = 0;
-    float min = 0;
-    for (int i=0;i<i_step;i++){
-      if (values[i]>max){
-        max = values[i];
-      }
-      if (values[i]<min){
-        min = values[i];
-      }
-    }
 
-    i_step = 0;
-    lastMsg = now;
-
-    //if(abs(max) > abs(min)){
-    if(positive_flag == true){
-      value = max;
-    }else{
-      value = min;
-    }
-    int v = floor(value*0.8)+90;
+    value = values[i_step-1];
+      
+    int v = value*amp_factor+90;
     if (v>135){
       v = 135;
     }else if(v<45){
@@ -252,6 +276,13 @@ void loop(void)
 
     positive_flag = !positive_flag;
     servo2.write(v);
+    if (WiFi.status() == WL_CONNECTED){
+      udp.beginPacket(udpAddress,udpPort);
+      udp.printf("Angle:%ld:%d|deg", now,v-90); 
+      udp.endPacket();
+    }
+    i_step = 0;
+    lastMsg = now;
   }
 
 
